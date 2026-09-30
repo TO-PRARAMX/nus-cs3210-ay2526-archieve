@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+inputs/
+
+engine
+engine.debug
+
+OUT*
+
+logs/
+
+failed_input.bin

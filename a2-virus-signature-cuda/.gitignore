@@ -1,0 +1,14 @@
+gen_sample
+gen_sig
+matcher*
+samp*.fastq
+sig*.fasta
+gpu_spec
+*-rep
+Nsight/
+output/
+input/
+build/
+*.ipynb
+Images/
+data/

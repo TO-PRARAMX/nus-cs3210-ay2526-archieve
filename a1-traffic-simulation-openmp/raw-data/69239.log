@@ -1,0 +1,20 @@
+ Running job !
+We are running on soctf-pdc-027.comp.nus.edu.sg
+Job started at Thu Feb 19 10:18:40 PM +08 2026
+==================================================
+USER EXECUTABLE PERFORMANCE STATISTICS
+input file: performanceReport/cpuModel/5e6
+partition: w5-3423
+==================================================
+
+ Performance counter stats for 'bash -c ./sim.perf < performanceReport/cpuModel/5e6 > /dev/null' (10 runs):
+
+   240,288,138,487 ns   user_time                                                               ( +-  0.05% )
+   715,071,496,662      cycles                                                                  ( +-  0.12% )
+   468,949,747,154      instructions                     #    0.66  insn per cycle              ( +-  0.02% )
+       380,926,817      LLC-loads                                                               ( +-  0.22% )
+       325,382,700      LLC-load-misses                  #   85.42% of all LL-cache accesses    ( +-  0.21% )
+
+             32.25 +- 1.97 seconds time elapsed  ( +-  6.12% )
+
+Job ended at Thu Feb 19 10:24:02 PM +08 2026

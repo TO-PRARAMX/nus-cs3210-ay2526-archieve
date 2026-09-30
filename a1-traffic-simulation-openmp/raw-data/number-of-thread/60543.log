@@ -1,0 +1,25 @@
+ Running job !
+We are running on soctf-pdc-008.comp.nus.edu.sg
+Job started at Thu Feb 19 16:27:27 +08 2026
+==================================================
+USER EXECUTABLE PERFORMANCE STATISTICS
+input file: performanceReport/cpuModel/1e4
+partition: xs-4114
+number of threads:1
+==================================================
+
+ Performance counter stats for 'bash -c ./sim.perf < performanceReport/cpuModel/1e4 > /dev/null' (10 runs):
+
+         240968102 ns   user_time                                                               ( +-  0.18% )
+         646978349      cycles                                                                  ( +-  0.04% )
+        1012739145      instructions                     #    1.57  insn per cycle              ( +-  0.00% )
+             36721      LLC-loads                                                               ( +-  3.46% )
+              4898      LLC-load-misses                  #   13.34% of all LL-cache accesses    ( +- 15.57% )
+
+            0.3498 +- 0.0113 seconds time elapsed  ( +-  3.24% )
+
+Lowering default frequency rate from 4000 to 3000.
+Please consider tweaking /proc/sys/kernel/perf_event_max_sample_rate.
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.088 MB perf_report/60543_report.data (1451 samples) ]
+Job ended at Thu Feb 19 16:27:33 +08 2026

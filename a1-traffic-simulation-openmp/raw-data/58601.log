@@ -1,0 +1,26 @@
+ Running job !
+We are running on soctf-pdc-037.comp.nus.edu.sg
+Job started at Thu Feb 19 13:04:31 +08 2026
+==================================================
+USER EXECUTABLE PERFORMANCE STATISTICS
+input file: performanceReport/carAndDensity/L50n_n1e5
+partition: i7-13700
+==================================================
+
+ Performance counter stats for 'bash -c ./sim.perf < performanceReport/carAndDensity/L50n_n1e5 > /dev/null' (10 runs):
+
+        1125345450 ns   user_time                                                               ( +-  0.25% )
+     <not counted>      cpu_atom/cycles/                                                        (0.00%)
+        3665985082      cpu_core/cycles/                                                        ( +-  0.14% )
+     <not counted>      cpu_atom/instructions/                                                  (0.00%)
+        4677486249      cpu_core/instructions/           #    1.28  insn per cycle              ( +-  0.02% )
+     <not counted>      cpu_atom/LLC-loads/                                                     (0.00%)
+           2341577      cpu_core/LLC-loads/                                                     ( +-  0.74% )
+     <not counted>      cpu_atom/LLC-load-misses/                                               (0.00%)
+              8280      cpu_core/LLC-load-misses/        #    0.35% of all LL-cache accesses    ( +-  8.20% )
+
+           0.30793 +- 0.00422 seconds time elapsed  ( +-  1.37% )
+
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.515 MB perf_report/58601_report.data (10767 samples) ]
+Job ended at Thu Feb 19 13:04:36 +08 2026

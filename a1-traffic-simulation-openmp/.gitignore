@@ -1,0 +1,6 @@
+.editorconfig
+sim.perf
+sim.debug
+inputs/*
+common.cc
+common.h

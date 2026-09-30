@@ -1,0 +1,430 @@
+#include "kseq/kseq.h"
+#include "common.h"
+#include <stdexcept>
+#include <iostream>
+#include <assert.h>
+#include <stdexcept>
+// #include "sum.cuh"
+
+#define ALIGN_16(x) (((x) + 15) & ~15)
+
+// changable through makefile
+#ifndef BLOCK_SIZE
+    #define BLOCK_SIZE 256
+#endif
+#ifndef NUM_STREAM
+    #define NUM_STREAM 16
+#endif
+#ifndef SAMPLE_SUBSTRING_SIZE
+    #define SAMPLE_SUBSTRING_SIZE 16384
+#endif
+#ifndef SIGNATURE_MAX_LENGTH
+    #define SIGNATURE_MAX_LENGTH 10000
+#endif
+#ifndef GRID_MATCH
+    #define GRID_MATCH 1
+#endif
+
+using namespace klibpp;
+
+struct cudaSample{
+    int idx;
+    char *seq;
+    char *qual;
+    int len;
+};
+
+struct StreamAssets {
+    char *d_seqs; 
+    char *d_quals;
+    int  *d_confs;
+};
+
+void check_cuda_errors()
+{
+    cudaError_t rc;
+    rc = cudaGetLastError();
+    if (rc != cudaSuccess)
+    {
+        printf("Last CUDA error %s\n", cudaGetErrorString(rc));
+    }
+
+}
+
+__device__ void warp_reduce(volatile int* sdata, int tid) {
+    sdata[tid] = sdata[tid] + sdata[tid + 32];
+    sdata[tid] = sdata[tid] + sdata[tid + 16];
+    sdata[tid] = sdata[tid] + sdata[tid + 8];
+    sdata[tid] = sdata[tid] + sdata[tid + 4];
+    sdata[tid] = sdata[tid] + sdata[tid + 2];
+    sdata[tid] = sdata[tid] + sdata[tid + 1];
+}
+
+__device__ void reduce(int* res, int* __restrict__ data){
+    int tid = threadIdx.x;
+    for(int s = blockDim.x/2; s > 32; s >>= 1) {
+        if (tid < s) {
+            data[tid] += data[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid < 32) warp_reduce(data, tid);
+    if (tid == 0) *res = data[0];
+}
+
+__global__ void sum(int *integrity, const char* __restrict__ qual, int size){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    extern __shared__ int data[];
+    __shared__ int partialSum;
+
+    if (threadIdx.x == 0) partialSum = 0;
+    __syncthreads();
+
+    if (idx < size) data[threadIdx.x] = qual[idx] - 33;
+    else data[threadIdx.x] = 0;
+    __syncthreads();
+
+    reduce(&partialSum, data);
+    if(threadIdx.x == 0) atomicAdd(integrity, partialSum);
+}
+
+__device__ void sharedMemCpy( char* __restrict__ dst, const char* __restrict__ src, int count, int srcLength, int srcOffset = 0){
+
+    if (srcOffset >= srcLength) return;
+    int num = min(count, srcLength - srcOffset);
+    int tid = threadIdx.x; 
+
+    // vectorized version
+    #ifdef VECTOR_MEM_LOAD
+        assert(num & 15 == 0);
+        int4 *d4 = (int4*)(dst);
+        int4 *s4 = (int4*)(src+srcOffset);
+
+        int round = (num + 15) >> 4;
+        
+        // load 4 char for each iteration
+        for(int idx = tid; idx < round; idx+= blockDim.x){
+            d4[idx] = s4[idx];
+        }
+    #else
+        for(int idx = tid; idx < num; idx += blockDim.x){
+            dst[idx] = src[srcOffset + idx];
+        }
+    #endif
+
+}
+
+
+void setIntegrity(int *hostIntegrity, const char* __restrict__ sample_qual, int sample_len, cudaStream_t stream){
+
+    int num_block = (sample_len + BLOCK_SIZE - 1)/BLOCK_SIZE;
+    // get score of each index first;
+
+    int *deviceIntegrity;
+    cudaMallocAsync((void **)&deviceIntegrity, sizeof(int), stream);
+    cudaMemsetAsync(deviceIntegrity, 0, sizeof(int), stream);
+
+    sum<<<num_block, BLOCK_SIZE, BLOCK_SIZE*sizeof(int), stream>>>(deviceIntegrity, sample_qual, sample_len);
+
+    int tmp;
+    cudaMemcpyAsync(&tmp, deviceIntegrity, sizeof(int), cudaMemcpyDeviceToHost, stream);
+    
+    cudaStreamSynchronize(stream);
+    *hostIntegrity = tmp %97;
+    cudaFreeAsync(deviceIntegrity, stream);
+}
+
+__global__ void kernelMatch(
+    int* confidences,
+    const char* __restrict__ sample_seq, 
+    const char* __restrict__ sample_qual, 
+    const int sample_len, 
+    const char** __restrict__ signature_seqs, 
+    const int* __restrict__ signature_lengths, 
+    const int n_sig
+    )
+{
+    
+    //local index variables
+    const int tid = threadIdx.x;
+    
+    // other variable
+    int start_offset = blockIdx.x * (SAMPLE_SUBSTRING_SIZE - SIGNATURE_MAX_LENGTH);
+    if (start_offset >= sample_len) return;
+    int substring_len = min(sample_len - start_offset, SAMPLE_SUBSTRING_SIZE);
+
+    // dynamically allocated, shared memories 
+    extern __shared__ char smem[];
+    char *signature = smem;
+    char *subSample = signature + ALIGN_16(SIGNATURE_MAX_LENGTH * sizeof(char));
+    // char *subSample = smem;
+    char *subQual = subSample + ALIGN_16(substring_len * sizeof(char));
+
+
+    // load substring into each block
+    sharedMemCpy(subSample, sample_seq, substring_len, sample_len, start_offset);
+    sharedMemCpy(subQual, sample_qual, substring_len, sample_len, start_offset);
+    __syncthreads();
+
+    // looping through virus
+    // every block help check virus in one by one order
+    for(int k = blockIdx.y; k < n_sig; k += blockDim.y){
+        
+        // load signature into shared memory
+        int len_sig = __ldg(&signature_lengths[k]);
+
+        sharedMemCpy(signature, signature_seqs[k], len_sig, len_sig);
+        // const char* signature = signature_seqs[k];
+        
+        // enable warp tiling: 1 warp scan through one window together
+        #ifdef WARP_TILE
+        // result variables
+        __shared__ int hasMatch;
+        __shared__ int bestMatch;
+        if (tid == 0){
+            hasMatch = 0;
+            bestMatch = -1;  
+        }
+        __syncthreads();
+        const int warpNum = blockDim.x >> 5;
+        const int warpId  = tid >> 5;
+        const int laneId  = tid & 31;
+
+        for(int i = warpId; i <= substring_len - len_sig; i += warpNum) {
+            bool mismatchFound = false;
+            int charScore = 0;
+            // bool warpBreak = false;
+
+            for(int j = 0; j < (len_sig + 31) /32 ; j++) {
+                int idx = j * 32 + laneId;
+                bool char_mismatch = false;
+                if(idx < len_sig){
+                    int cmp = subSample[i + idx] ^ signature[j];
+                    // int cmp = subSample[i + idx] ^ __ldg(&signature[j]);
+                    charScore += subQual[i + idx] - 33; 
+                    char_mismatch = !(0x400A201 >> (cmp & 31) & 1);
+                }
+
+                if (__any_sync(0xFFFFFFFF, char_mismatch)) {
+                    mismatchFound = true;
+                    break;
+                }
+
+            }
+
+            if (!mismatchFound) {
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    charScore += __shfl_down_sync(0xFFFFFFFF, charScore, offset);
+                }
+
+                if (laneId == 0) {
+                    atomicMax(&bestMatch, charScore); 
+                    atomicOr(&hasMatch, 1); // Use the shared flag
+                }
+            }
+        }
+        if (laneId == 0 && hasMatch) atomicMax(&confidences[k], bestMatch);
+        __syncthreads();
+            // each thread read through window indvidually
+        #else
+        int threadBestScore = -1;
+        const int window = substring_len - len_sig;
+        int localScore = 0;
+        for(int i = tid; i <= window; i += blockDim.x){
+        
+        #ifdef VECTOR_MATCH
+        uint32_t 
+        for(int j = 0; j < len_sig; j+=4){
+            uint32_t diff = *(uint32_t*)(&subSample[i+j]) ^ *(uint32_t*)(&signature[j]);
+            bool chunkFailed = false;
+
+            #pragma unroll
+            for(int byte = 0; byte < 4; byte++) {
+                uint8_t cmp = (diff >> (byte * 8)) & 0xFF;
+                chunkFailed |= !(0x400A201 >> (cmp & 31) & 1);
+            }
+            
+            if (chunkFailed) {
+                localScore = -1;
+                break;
+            }
+            
+            // add score from 4 position in one go
+            uint32_t q_vec = *(uint32_t*)(&subQual[i+j]);
+            localScore += (int)__dp4a(q_vec, 0x01010101U, 0U) - 132;
+        }
+        #else
+        // One thread checks the entire signature for its specific window 'i'
+        for(int j = 0; j < len_sig; j++){
+            int cmp = subSample[i+j] ^ signature[j];
+            // int cmp = subSample[i+j] ^ __ldg(&signature[j]);
+            if (!(0x400A201 >> (cmp & 31) & 1)) {
+                localScore = -1;
+                break;
+            }
+            localScore += subQual[i + j] - 33; 
+        }
+        threadBestScore = max(threadBestScore, localScore);
+        #endif
+        }
+        if (threadBestScore >= 0) atomicMax(&confidences[k], threadBestScore);
+        __syncthreads();
+        #endif
+    }
+}
+
+void hostMatch(
+    const cudaSample sample,
+    const std::vector<klibpp::KSeq> &samples,
+    const std::vector<klibpp::KSeq> &signatures,
+    const std::vector<int> &hostConfidences,
+    std::vector<MatchResult> &matches,
+    cudaStream_t stream
+    )
+{   
+
+    int integrity = -1;
+    for(int i = 0; i < signatures.size(); i++){
+        int confidence = hostConfidences[i];
+        // only push matches if there is any match at all
+        if(confidence > -1) {
+            // if integrate is never calculated before
+            if(integrity == -1) setIntegrity(&integrity, sample.qual, sample.len, stream);
+            
+            float confidence_pct = (float)confidence / signatures[i].seq.length();
+            MatchResult match = {samples[sample.idx].name, signatures[i].name, confidence_pct, integrity};
+            matches.push_back(match);
+            }
+        }
+    }
+
+void runMatcher(const std::vector<klibpp::KSeq>& samples, const std::vector<klibpp::KSeq>& signatures, std::vector<MatchResult>& matches) {
+
+
+    #ifdef VECTOR_MEM_LOAD
+    if (SAMPLE_SUBSTRING_SIZE & 15){
+        throw std::runtime_error("Size of sample substring must be divisible by 16!");
+    }
+    #endif
+
+    std::vector<cudaStream_t> streams(NUM_STREAM);
+    for ( auto & s : streams ) cudaStreamCreate (&s);
+
+    int n_sample = samples.size(), n_sig = signatures.size();
+
+    // Initialize cuda array of viruses, which will be passed in function call
+    int *cuda_virus_lengths;
+    char **cuda_virus_seqs;
+
+    std::vector<int> host_virus_lengths(n_sig);
+    char **host_virus_seqs = new char*[n_sig];
+
+    // allocate memory for each virus into unified memory of gpu and 
+    cudaMalloc((void **)&cuda_virus_lengths, n_sig * sizeof(int));
+    for(int i = 0; i < n_sig; i++){
+        // virus length
+        host_virus_lengths[i] = signatures[i].seq.length();    
+        cudaMemcpyAsync(&cuda_virus_lengths[i], &host_virus_lengths[i], sizeof(int), cudaMemcpyHostToDevice, streams[i % NUM_STREAM]);
+        // virus sequence
+        cudaMallocAsync(&host_virus_seqs[i], host_virus_lengths[i], streams[i % NUM_STREAM]);
+        cudaMemcpyAsync(host_virus_seqs[i], signatures[i].seq.data(), host_virus_lengths[i], cudaMemcpyHostToDevice, streams[i % NUM_STREAM]);
+    }
+    cudaDeviceSynchronize();
+    
+    cudaMalloc((void **)&cuda_virus_seqs, n_sig * sizeof(char*));
+    cudaMemcpy(cuda_virus_seqs, host_virus_seqs, n_sig * sizeof(char*), cudaMemcpyHostToDevice);
+
+    std::vector<char*> d_seqs(n_sample), d_quals(n_sample);
+    std::vector<int*> d_confs(n_sample);
+    std::vector<std::vector<int>> allHostConfidences(n_sample, std::vector<int>(n_sig));
+
+    // check sample one-by-one
+    for(int i = 0; i < n_sample; i++){
+        // identify stream
+        int streamIdx = i % NUM_STREAM;
+        int len_sample = samples[i].seq.size();
+        cudaStream_t stream = streams[streamIdx];
+
+        // prepare sample strings for kernel
+        cudaMallocAsync((void **)&d_seqs[i], len_sample, stream); 
+        cudaMallocAsync((void **)&d_quals[i], len_sample, stream); 
+        cudaMallocAsync((void **)&d_confs[i], n_sig * sizeof(int), stream);
+        cudaMemcpyAsync(d_seqs[i], samples[i].seq.data(), len_sample, cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_quals[i], samples[i].qual.data(), len_sample, cudaMemcpyHostToDevice, stream);
+        cudaMemsetAsync(d_confs[i], -1, n_sig *sizeof(int), stream);
+
+        #ifdef VECTOR_MEM_LOAD
+        int padded_len = (len_sample + 15) & ~15;
+        if (padded_len > len_sample) {
+            cudaMemsetAsync(d_seqs[i] + len_sample, 0, padded_len - len_sample, stream);
+            cudaMemsetAsync(d_quals[i] + len_sample, '!', padded_len - len_sample, stream);
+        }
+        #endif
+
+        // perform matching
+        // calculate number of block needed to be called on kernel and size of dynamic shared memory
+        int chunk_stride = SAMPLE_SUBSTRING_SIZE - SIGNATURE_MAX_LENGTH;
+        int num_block = (len_sample + chunk_stride - 1) / chunk_stride;
+        int substring_len = min(len_sample, SAMPLE_SUBSTRING_SIZE);
+        int shared_dynamic = ALIGN_16(SIGNATURE_MAX_LENGTH*sizeof(char)) + (2 * ALIGN_16(substring_len*sizeof(char)));
+        // int shared_dynamic = 2 * ALIGN_16(substring_len*sizeof(char));
+
+        // call matchKernel to to evaluate confidence of each sample and signature pair
+        // if there is a match, then confidence is the total score of best match, otherwise -1 
+        dim3 grid(num_block, GRID_MATCH);
+        kernelMatch<<<grid,BLOCK_SIZE,shared_dynamic,stream>>>(d_confs[i], d_seqs[i], d_quals[i], len_sample, (const char**)cuda_virus_seqs, cuda_virus_lengths, n_sig);
+       
+    }
+    cudaDeviceSynchronize();
+
+    for(int i = 0; i < n_sample; i++){
+        cudaStream_t stream = streams[i % NUM_STREAM];
+        cudaMemcpyAsync(allHostConfidences[i].data(), d_confs[i], n_sig * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    }
+    cudaDeviceSynchronize();
+
+    for(int i = 0; i < n_sample; i++){
+        cudaStream_t stream = streams[i % NUM_STREAM];
+        int len_sample = samples[i].seq.size();
+        
+        cudaSample d_sample{i, d_seqs[i], d_quals[i], len_sample};
+
+        hostMatch(d_sample, samples, signatures, allHostConfidences[i], matches, stream);
+        
+        cudaFreeAsync(d_confs[i], stream);
+        cudaFreeAsync(d_seqs[i], stream);
+        cudaFreeAsync(d_quals[i], stream);
+    }
+    cudaDeviceSynchronize();
+    
+    // std::vector<int> hostConfidences(n_sig);
+    // for(int i = 0; i < n_sample; i++){
+        
+    //     cudaStream_t stream = streams[i % NUM_STREAM];
+    //     int len_sample = samples[i].seq.size();
+        
+    //     cudaMemcpyAsync(hostConfidences.data(), d_confs[i], n_sig * sizeof(int), cudaMemcpyDeviceToHost, stream);
+        
+    //     cudaSample d_sample{i, d_seqs[i], d_quals[i], len_sample};
+    //     hostMatch(d_sample, samples, signatures, hostConfidences, matches, stream);
+        
+    //     cudaFreeAsync(d_confs[i], stream);
+    //     cudaFreeAsync(d_seqs[i], stream);
+    //     cudaFreeAsync(d_quals[i], stream);
+    // }
+
+    // Finally free virus
+    for(int i = 0; i < n_sig; i++){
+        cudaFreeAsync(host_virus_seqs[i], streams[i % NUM_STREAM]);
+    }
+    cudaDeviceSynchronize();
+    cudaFree(cuda_virus_seqs);
+    cudaFree(cuda_virus_lengths);
+    for(int i = 0; i < NUM_STREAM; i++) cudaStreamDestroy(streams[i]);
+    delete[] host_virus_seqs;
+
+    check_cuda_errors();
+}
+
+
